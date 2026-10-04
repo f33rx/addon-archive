@@ -114,6 +114,7 @@ local REQ_SLOT = 9
 local REQ_TIMEOUT = 10
 local REQ_FLAGPOSTFAIL = 11
 local REQ_FLAGNOSPACE = 12
+local REQ_LOADED = 13 -- item is sitting in the sell slot; StartAuction not sent yet
 -- function to create a new posting request table; keep sync'd with the above constants
 private.lastPostId = 0
 function private.NewRequestTable(sig, count, bid, buyout, duration)
@@ -132,6 +133,7 @@ function private.NewRequestTable(sig, count, bid, buyout, duration)
 		0, --REQ_TIMEOUT
 		false, --REQ_FLAGPOSTFAIL
 		false, --REQ_FLAGNOSPACE
+		false, --REQ_LOADED
 	}
 	return request
 end
@@ -603,14 +605,51 @@ end
 --[[
 	PRIVATE: ProcessPosts()
 	This function is responsible for maintaining and processing the post queue.
+
+	ChromieCraft / AzerothCore (3.3.5):
+	StartAuction(bid, buyout, duration, stackSize, numStacks).
+	Omitting stackSize sends a count of 0. This core drops that packet without
+	an error, so the post sits until the timeout. Pass the sell-slot count and
+	one stack. Do not click the sell slot again after StartAuction; that picks
+	the item back up before the server accepts it. Wait for "Auction created."
 ]]
 local LAG_ADJUST = (3 / 1000)
-local POST_TIMEOUT = 6 -- seconds general timeout
+local POST_TIMEOUT = 12 -- seconds general timeout (was 6; AC bag updates are slower)
 local POST_ERROR_PAUSE = 1 -- seconds pause after error before trying next request
-local POST_THROTTLE = 0 -- time before starting to post the next item in the queue
-function private.ProcessPosts(source)
+local POST_THROTTLE = 0.35 -- time before starting to post the next item in the queue
+local POST_FAIL_ERRORS = {}
+do
+	local failList = {
+		ERR_NOT_ENOUGH_MONEY,
+		ERR_AUCTION_DATABASE_ERROR,
+		ERR_AUCTION_BOUND_ITEM,
+		ERR_AUCTION_CONJURED_ITEM,
+		ERR_AUCTION_QUEST_ITEM,
+		ERR_AUCTION_LOOT_ITEM,
+		ERR_AUCTION_REPAIR_ITEM,
+		ERR_AUCTION_BAG,
+		ERR_AUCTION_LIMITED_DURATION_ITEM,
+	}
+	for i = 1, #failList do
+		if failList[i] then
+			POST_FAIL_ERRORS[failList[i]] = true
+		end
+	end
+end
+
+local function RecoverAuctionSlot()
+	ClearCursor()
+	if GetAuctionSellItemInfo() then
+		ClickAuctionSellItemButton()
+		ClearCursor()
+	end
+end
+
+local function ProcessPostsWork(source)
 	if lib.GetQueueLen() <= 0 or not (AuctionFrame and AuctionFrame:IsVisible()) then
 		private.Wait() -- put timer to sleep
+		private.postConfirmed = nil
+		private.postFailed = nil
 		return
 	end
 	-- use longer timeout delays if connectivity is bad, but always at least 1 second
@@ -621,23 +660,91 @@ function private.ProcessPosts(source)
 	local request = private.GetQueueIndex(1)
 
 	if request[REQ_POSTLINK] then
-		-- We're waiting for the item to vanish from the bags
+		-- Waiting for the server to accept the listing.
 		local link = GetContainerItemLink(request[REQ_BAG], request[REQ_SLOT])
-		if not link or link ~= request[REQ_POSTLINK] then
-			-- Successful Auction!
+		local bagGone = not link or link ~= request[REQ_POSTLINK]
+		local slotEmpty = not GetAuctionSellItemInfo()
+
+		if private.postFailed then
+			local errText = private.postFailed
+			private.postFailed = nil
+			private.postConfirmed = nil
+			RecoverAuctionSlot()
+			local _, itemCount = GetContainerItemInfo(request[REQ_BAG], request[REQ_SLOT])
+			itemCount = itemCount or request[REQ_COUNT]
+			local msg = ("Unable to create auction for %s x%d: %s"):format(request[REQ_POSTLINK], itemCount, errText)
+			debugPrint(msg, "CorePost", "Posting Failure", "Warning")
+			private.QueueRemove()
+			private.Wait(POST_ERROR_PAUSE)
+			AucAdvanced.SendProcessorMessage("postresult", false, request[REQ_ID], request, "FailRetry")
+			message(msg)
+			return
+		end
+
+		-- Server accepted the listing. The sell slot may still show the item
+		-- until the inventory update lands; do not wait out the timeout for that.
+		if private.postConfirmed then
+			private.postConfirmed = nil
+			private.suppressSlotClearUntil = GetTime() + 1.5
 			private.QueueRemove()
 			private.Wait(POST_THROTTLE)
 			AucAdvanced.SendProcessorMessage("postresult", true, request[REQ_ID], request)
-		elseif GetTime() > request[REQ_TIMEOUT] then
-			-- Can't auction this item!
+			return
+		end
+
+		if bagGone and slotEmpty then
+			private.QueueRemove()
+			private.Wait(POST_THROTTLE)
+			AucAdvanced.SendProcessorMessage("postresult", true, request[REQ_ID], request)
+			return
+		end
+
+		if GetTime() > request[REQ_TIMEOUT] then
+			RecoverAuctionSlot()
 			local _, itemCount = GetContainerItemInfo(request[REQ_BAG], request[REQ_SLOT])
-			local msg = ("Unable to confirm auction for %s x%d: %s"):format(link, itemCount, ErrorText["FailTimeout"])
+			itemCount = itemCount or request[REQ_COUNT]
+			local msg = ("Unable to confirm auction for %s x%d: %s"):format(request[REQ_POSTLINK], itemCount, ErrorText["FailTimeout"])
 			debugPrint(msg, "CorePost", "Posting timeout", "Warning")
 			private.QueueRemove()
 			private.Wait(POST_ERROR_PAUSE)
 			AucAdvanced.SendProcessorMessage("postresult", false, request[REQ_ID], request, "FailTimeout")
 			message(msg)
 		end
+		return
+	end
+
+	-- Item was placed in the sell slot last pulse; send StartAuction now.
+	if request[REQ_LOADED] then
+		local _, _, stackSize = GetAuctionSellItemInfo()
+		if not stackSize or stackSize < 1 then
+			-- Slot emptied, or the count is not ready yet. A zero count is what
+			-- makes this core ignore the sell packet.
+			request[REQ_LOADED] = false
+			return
+		end
+		if AuctionFrameAuctions then
+			AuctionFrameAuctions.duration = request[REQ_DURATION]
+		end
+		if AuctionsStackSizeEntry then
+			AuctionsStackSizeEntry:SetNumber(stackSize)
+		end
+		if AuctionsNumStacksEntry then
+			AuctionsNumStacksEntry:SetNumber(1)
+		end
+		private.postConfirmed = nil
+		private.postFailed = nil
+		-- duration is 1, 2, or 3. Fourth arg is items in this stack, fifth is
+		-- how many stacks. Auctioneer queues one stack per request.
+		StartAuction(request[REQ_BID], request[REQ_BUYOUT], request[REQ_DURATION], stackSize, 1)
+		-- Do NOT ClickAuctionSellItemButton here — that undoes the listing on this core.
+		request[REQ_LOADED] = false
+		request[REQ_POSTLINK] = request._pendingLink
+			or GetContainerItemLink(request[REQ_BAG], request[REQ_SLOT])
+			or GetAuctionSellItemInfo()
+			or "item"
+		request._pendingLink = nil
+		request[REQ_TIMEOUT] = GetTime() + max(lag * POST_TIMEOUT, 10)
+		private.Wait(0.2)
 		return
 	end
 
@@ -670,6 +777,12 @@ function private.ProcessPosts(source)
 		end
 		local link = GetContainerItemLink(bag,slot)
 		if GetAuctionSellItemInfo() then
+			-- A just-accepted post can leave the item painted in the slot until
+			-- the bag update arrives. Clicking now pulls it back off the auction.
+			if private.suppressSlotClearUntil and GetTime() < private.suppressSlotClearUntil then
+				return
+			end
+			private.suppressSlotClearUntil = nil
 			-- auction slot is already occupied, try to clear it
 			ClickAuctionSellItemButton()
 			ClearCursor()
@@ -698,33 +811,27 @@ function private.ProcessPosts(source)
 			return
 		end
 
-		StartAuction(request[REQ_BID], request[REQ_BUYOUT], request[REQ_DURATION])
-		ClickAuctionSellItemButton()
-		if (CursorHasItem()) then -- Didn't auction successfully
-			ClearCursor() -- Put it back in the bags
-			if failed then
-				-- Auction posting has failed twice - abort this request
-				local _, itemCount = GetContainerItemInfo(bag,slot)
-				local msg = ("Unable to create auction for %s x%d: %s"):format(link, itemCount, ErrorText["FailRetry"])
-				debugPrint(msg, "CorePost", "Posting Failure", "Warning")
-				private.QueueRemove()
-				private.Wait(POST_ERROR_PAUSE)
-				AucAdvanced.SendProcessorMessage("postresult", false, request[REQ_ID], request, "FailRetry")
-				message(msg)
-				return
-			else
-				-- First time the auction posting has failed
-				-- The problem may be due to lag or something else that will clear given enough time
-				request[REQ_TIMEOUT] = GetTime() + lag * POST_TIMEOUT -- delay before trying to post this auction again
-				request[REQ_FLAGPOSTFAIL] = true
-				private.QueueReorder() -- Move to the back of the queue and try a different auction (if possible)
-			end
-		else -- Successful post - wait for this item to vanish from bag
-			request[REQ_TIMEOUT] = GetTime() + lag * POST_TIMEOUT
-			request[REQ_POSTLINK] = link
-			request[REQ_BAG] = bag
-			request[REQ_SLOT] = slot
-		end
+		-- Leave the item in the sell slot and post on the next pulse.
+		-- Clicking the slot again here is what broke posting on this core.
+		request[REQ_BAG] = bag
+		request[REQ_SLOT] = slot
+		request[REQ_LOADED] = true
+		-- Stash the link now; the bag slot may already be empty after the drop.
+		request[REQ_TIMEOUT] = GetTime() + max(lag * POST_TIMEOUT, 10)
+		-- Store link in a side field until StartAuction; REQ_POSTLINK must stay
+		-- false so we don't treat "item left bags into sell slot" as success.
+		request._pendingLink = link
+		private.Wait(0) -- next OnUpdate
+	end
+end
+
+function private.ProcessPosts(source)
+	if private.postBusy then return end
+	private.postBusy = true
+	local ok, err = pcall(ProcessPostsWork, source)
+	private.postBusy = nil
+	if not ok then
+		geterrorhandler()(err)
 	end
 end
 
@@ -761,6 +868,20 @@ private.updateFrame:SetScript("OnUpdate", function(obj, delay)
 	obj.timer = obj.timer - delay
 	if obj.timer <= 0 then
 		private.ProcessPosts("timer") -- obj.timer will be updated by ProcessPosts
+	end
+end)
+private.updateFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+private.updateFrame:RegisterEvent("UI_ERROR_MESSAGE")
+private.updateFrame:SetScript("OnEvent", function(self, event, arg1)
+	if not self.timer then return end
+	if arg1 == ERR_AUCTION_STARTED and (event == "CHAT_MSG_SYSTEM" or event == "UI_ERROR_MESSAGE") then
+		private.postConfirmed = true
+		private.ProcessPosts("posted")
+	elseif event == "UI_ERROR_MESSAGE" then
+		if arg1 and POST_FAIL_ERRORS[arg1] then
+			private.postFailed = arg1
+			private.ProcessPosts("error")
+		end
 	end
 end)
 
